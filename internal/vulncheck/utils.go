@@ -288,7 +288,9 @@ func validFixes(version string, affected []osv.Affected) []string {
 func fixNegated(fix string, affected []osv.Affected) bool {
 	for _, a := range affected {
 		for _, r := range a.Ranges {
-			if semver.ContainsSemver(r, fix) {
+			// Ranges with malformed events cannot be
+			// interpreted, so they cannot negate fix.
+			if contains, err := semver.ContainsSemver(r, fix); err == nil && contains {
 				return true
 			}
 		}
