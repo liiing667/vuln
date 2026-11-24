@@ -165,18 +165,24 @@ func (g *PackageGraph) fixupPackage(pkg *packages.Package) {
 }
 
 // findModule finds a module for package.
-// It does a longest prefix search amongst the existing modules, if that does
-// not find anything, it returns the "unknown" module.
+// It does a longest path-component prefix search amongst the existing
+// modules. If that does not find anything, it returns the "unknown" module.
 func (g *PackageGraph) findModule(pkgPath string) *packages.Module {
 	//TODO: better stdlib test
 	if IsStdPackage(pkgPath) {
 		return g.GetModule(internal.GoStdModulePath)
 	}
+	var best *packages.Module
 	for _, m := range g.modules {
-		//TODO: not first match, best match...
-		if pkgPath == m.Path || strings.HasPrefix(pkgPath, m.Path+"/") {
-			return m
+		if !modulePathMatches(pkgPath, m.Path) {
+			continue
 		}
+		if best == nil || len(m.Path) > len(best.Path) {
+			best = m
+		}
+	}
+	if best != nil {
+		return best
 	}
 	return g.GetModule(internal.UnknownModulePath)
 }
@@ -255,7 +261,7 @@ func (e *packageError) Error() string {
 
 func (g *PackageGraph) SBOM() *govulncheck.SBOM {
 	getMod := func(mod *packages.Module) *govulncheck.Module {
-		if mod.Replace != nil {
+		if mod.Replace != nil && mod.Replace.Path != "" {
 			return &govulncheck.Module{
 				Path:    mod.Replace.Path,
 				Version: mod.Replace.Version,

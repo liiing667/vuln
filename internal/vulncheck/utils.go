@@ -297,7 +297,7 @@ func fixNegated(fix string, affected []osv.Affected) bool {
 }
 
 func modPath(mod *packages.Module) string {
-	if mod.Replace != nil {
+	if mod.Replace != nil && mod.Replace.Path != "" {
 		return mod.Replace.Path
 	}
 	return mod.Path
@@ -308,6 +308,38 @@ func modVersion(mod *packages.Module) string {
 		return mod.Replace.Version
 	}
 	return mod.Version
+}
+
+// modulePathMatches reports whether importPath belongs to the module
+// rooted at modPath.
+//
+// Matching is done on path component boundaries, so that a module path
+// that is only a textual prefix of another one, such as "example.com/foo"
+// and "example.com/foobar", does not match the wrong module.
+func modulePathMatches(importPath, modPath string) bool {
+	if modPath == "" {
+		return false
+	}
+	return importPath == modPath || strings.HasPrefix(importPath, modPath+"/")
+}
+
+// moduleImportPaths returns the import paths under which importPath may be
+// described by vulnerability data for mod. For a replacement module, the
+// vulnerability database describes packages using the replacement module
+// path, so both the original and the rewritten paths are returned.
+func moduleImportPaths(mod *packages.Module, importPath string) []string {
+	if mod.Replace == nil || mod.Replace.Path == "" || mod.Replace.Path == mod.Path {
+		return []string{importPath}
+	}
+
+	switch {
+	case modulePathMatches(importPath, mod.Path):
+		return []string{importPath, mod.Replace.Path + strings.TrimPrefix(importPath, mod.Path)}
+	case modulePathMatches(importPath, mod.Replace.Path):
+		return []string{importPath, mod.Path + strings.TrimPrefix(importPath, mod.Replace.Path)}
+	default:
+		return []string{importPath}
+	}
 }
 
 // pkgPath returns the path of the f's enclosing package, if any.

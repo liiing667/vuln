@@ -147,7 +147,10 @@ func affectingVulnerabilities(vulns []*ModVulns, os, arch string) affectingVulns
 				// information out as it might lead to incorrect results:
 				// Computing a latest fix could consider versions of these
 				// different packages.
-				if a.Module.Path != module.Path {
+				// The fetched vulnerabilities describe the module that is
+				// actually built, which is the replacement module when one
+				// is present.
+				if a.Module.Path != modPath(module) {
 					continue
 				}
 				if !affected(modVersion, a) {
@@ -231,6 +234,7 @@ func (aff affectingVulns) moduleVulns(module, importPath string) *ModVulns {
 
 	isStd := IsStdPackage(importPath)
 	var mostSpecificMod *ModVulns // for the case where !moduleKnown
+	mostSpecificLen := 0
 	for _, mod := range aff {
 		md := mod
 		if isStd && mod.Module.Path == internal.GoStdModulePath {
@@ -240,17 +244,28 @@ func (aff affectingVulns) moduleVulns(module, importPath string) *ModVulns {
 		}
 
 		if moduleKnown {
-			if mod.Module.Path == module {
+			if mod.Module.Path == module ||
+				(mod.Module.Replace != nil && mod.Module.Replace.Path == module) {
 				// If we know exactly which module we need,
 				// return its vulnerabilities.
 				return md
 			}
-		} else if strings.HasPrefix(importPath, md.Module.Path) {
+		} else {
 			// If module is unknown, we try to figure it out from importPath.
 			// We take the module whose path has the longest match to importPath.
-			// TODO: do matching based on path components.
-			if mostSpecificMod == nil || len(mostSpecificMod.Module.Path) < len(md.Module.Path) {
+			// A package of a replaced module can be described using either the
+			// original or the replacement module path.
+			modPath := md.Module.Path
+			matched := modulePathMatches(importPath, modPath)
+			if r := md.Module.Replace; r != nil && r.Path != "" && modulePathMatches(importPath, r.Path) {
+				matched = true
+				if len(r.Path) > len(modPath) {
+					modPath = r.Path
+				}
+			}
+			if matched && (mostSpecificMod == nil || mostSpecificLen < len(modPath)) {
 				mostSpecificMod = md
+				mostSpecificLen = len(modPath)
 			}
 		}
 	}
@@ -268,10 +283,11 @@ func (aff affectingVulns) ForPackage(module, importPath string) []*osv.Entry {
 		return nil
 	}
 
-	if mod.Module.Replace != nil {
-		// standard libraries do not have a module nor replace module
-		importPath = fmt.Sprintf("%s%s", mod.Module.Replace.Path, strings.TrimPrefix(importPath, mod.Module.Path))
-	}
+	importPaths := moduleImportPaths(mod.Module, importPath)
+	return packageVulns(mod, importPaths)
+}
+
+func packageVulns(mod *ModVulns, importPaths []string) []*osv.Entry {
 	vulns := mod.Vulns
 	packageVulns := []*osv.Entry{}
 Vuln:
@@ -284,7 +300,7 @@ Vuln:
 			}
 
 			for _, p := range a.EcosystemSpecific.Packages {
-				if p.Path == importPath {
+				if contains(importPaths, p.Path) {
 					packageVulns = append(packageVulns, v)
 					continue Vuln
 				}
@@ -296,10 +312,12 @@ Vuln:
 
 // ForSymbol returns vulnerabilities for symbol in aff.ForPackage(module, importPath).
 func (aff affectingVulns) ForSymbol(module, importPath, symbol string) []*osv.Entry {
-	vulns := aff.ForPackage(module, importPath)
-	if vulns == nil {
+	mod := aff.moduleVulns(module, importPath)
+	if mod == nil {
 		return nil
 	}
+	importPaths := moduleImportPaths(mod.Module, importPath)
+	vulns := packageVulns(mod, importPaths)
 
 	symbolVulns := []*osv.Entry{}
 vulnLoop:
@@ -312,7 +330,7 @@ vulnLoop:
 			}
 
 			for _, p := range a.EcosystemSpecific.Packages {
-				if p.Path != importPath {
+				if !contains(importPaths, p.Path) {
 					continue
 				}
 				if len(p.Symbols) > 0 && !contains(p.Symbols, symbol) {

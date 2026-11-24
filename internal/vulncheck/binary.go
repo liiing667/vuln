@@ -7,6 +7,7 @@ package vulncheck
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/vuln/internal"
@@ -103,7 +104,7 @@ func binary(ctx context.Context, handler govulncheck.Handler, bin *Bin, cfg *gov
 	}
 
 	// Group symbols per package to avoid querying affVulns all over again.
-	var pkgSymbols map[string][]string
+	var pkgSymbols map[string]binPackageInfo
 	if len(bin.PkgSymbols) == 0 {
 		// The binary exe is stripped. We currently cannot detect inlined
 		// symbols for stripped binaries (see #57764), so we report
@@ -130,27 +131,48 @@ func binary(ctx context.Context, handler govulncheck.Handler, bin *Bin, cfg *gov
 	return &Result{Vulns: symVulns}, nil
 }
 
-func packagesAndSymbols(bin *Bin) map[string][]string {
-	pkgSymbols := make(map[string][]string)
+// binPackageInfo groups the symbols found in a binary package. The module is
+// set when symbol information is unavailable and the owning module is known
+// from the vulnerability database instead.
+type binPackageInfo struct {
+	module  *packages.Module
+	symbols []string
+}
+
+func packagesAndSymbols(bin *Bin) map[string]binPackageInfo {
+	pkgSymbols := make(map[string]binPackageInfo)
 	for _, sym := range bin.PkgSymbols {
 		// If the name of the package is main, we need to expand
 		// it to its full path as that is what vuln db uses.
+		pkg := sym.Pkg
 		if sym.Pkg == "main" && bin.Path != "" {
-			pkgSymbols[bin.Path] = append(pkgSymbols[bin.Path], sym.Name)
-		} else {
-			pkgSymbols[sym.Pkg] = append(pkgSymbols[sym.Pkg], sym.Name)
+			pkg = bin.Path
 		}
+		info := pkgSymbols[pkg]
+		info.symbols = append(info.symbols, sym.Name)
+		pkgSymbols[pkg] = info
 	}
 	return pkgSymbols
 }
 
-func binImportedVulnPackages(graph *PackageGraph, pkgSymbols map[string][]string, affVulns affectingVulns) []*Vuln {
+// binaryPackage returns the package for pkg, using info.module as its
+// module when that module was determined from the vulnerability data.
+func binaryPackage(graph *PackageGraph, pkg string, info binPackageInfo) *packages.Package {
+	p := graph.GetPackage(pkg)
+	if info.module != nil {
+		p.Module = info.module
+	}
+	return p
+}
+
+func binImportedVulnPackages(graph *PackageGraph, pkgSymbols map[string]binPackageInfo, affVulns affectingVulns) []*Vuln {
 	var vulns []*Vuln
-	for pkg := range pkgSymbols {
-		for _, osv := range affVulns.ForPackage(internal.UnknownModulePath, pkg) {
+	for pkg, info := range pkgSymbols {
+		p := binaryPackage(graph, pkg, info)
+		for _, osv := range affVulns.ForPackage(pkgModPath(p), pkg) {
 			vuln := &Vuln{
 				OSV:     osv,
-				Package: graph.GetPackage(pkg),
+				Package: p,
 			}
 			vulns = append(vulns, vuln)
 		}
@@ -158,15 +180,17 @@ func binImportedVulnPackages(graph *PackageGraph, pkgSymbols map[string][]string
 	return vulns
 }
 
-func binVulnSymbols(graph *PackageGraph, pkgSymbols map[string][]string, affVulns affectingVulns) []*Vuln {
+func binVulnSymbols(graph *PackageGraph, pkgSymbols map[string]binPackageInfo, affVulns affectingVulns) []*Vuln {
 	var vulns []*Vuln
-	for pkg, symbols := range pkgSymbols {
-		for _, symbol := range symbols {
-			for _, osv := range affVulns.ForSymbol(internal.UnknownModulePath, pkg, symbol) {
+	for pkg, info := range pkgSymbols {
+		p := binaryPackage(graph, pkg, info)
+		mod := pkgModPath(p)
+		for _, symbol := range info.symbols {
+			for _, osv := range affVulns.ForSymbol(mod, pkg, symbol) {
 				vuln := &Vuln{
 					OSV:     osv,
 					Symbol:  symbol,
-					Package: graph.GetPackage(pkg),
+					Package: p,
 				}
 				vulns = append(vulns, vuln)
 			}
@@ -176,13 +200,23 @@ func binVulnSymbols(graph *PackageGraph, pkgSymbols map[string][]string, affVuln
 }
 
 // allKnownVulnerableSymbols returns all known vulnerable symbols for packages in graph.
-// If all symbols of a package are vulnerable, that is modeled as a wild car symbol "<pkg-path>/*".
-func allKnownVulnerableSymbols(affVulns affectingVulns) map[string][]string {
-	pkgSymbols := make(map[string][]string)
+// If all symbols of a package are vulnerable, that is modeled as a wildcard symbol "<pkg-path>/*".
+func allKnownVulnerableSymbols(affVulns affectingVulns) map[string]binPackageInfo {
+	pkgSymbols := make(map[string]binPackageInfo)
 	for _, mv := range affVulns {
 		for _, osv := range mv.Vulns {
 			for _, affected := range osv.Affected {
 				for _, p := range affected.EcosystemSpecific.Packages {
+					// Vulnerability data describes packages of a replaced
+					// module using the replacement module path. Map them
+					// back to the import path that the binary uses so that
+					// stripped and non-stripped binaries report the same
+					// package identity.
+					pkg := p.Path
+					if r := mv.Module.Replace; r != nil && r.Path != "" && r.Path != mv.Module.Path && modulePathMatches(pkg, r.Path) {
+						pkg = mv.Module.Path + strings.TrimPrefix(pkg, r.Path)
+					}
+
 					syms := p.Symbols
 					if len(syms) == 0 {
 						// If every symbol of pkg is vulnerable, we would ideally
@@ -191,14 +225,15 @@ func allKnownVulnerableSymbols(affVulns affectingVulns) map[string][]string {
 						// we don't have code of pkg here and we don't even have
 						// pkg symbols used in stripped binary, so we add a placeholder
 						// symbol.
-						//
-						// Note: this should not affect output of govulncheck since
-						// in binary mode no symbol/call stack information is
-						// communicated back to the user.
-						syms = []string{fmt.Sprintf("%s/*", p.Path)}
+						syms = []string{fmt.Sprintf("%s/*", pkg)}
 					}
 
-					pkgSymbols[p.Path] = append(pkgSymbols[p.Path], syms...)
+					info := pkgSymbols[pkg]
+					if info.module == nil {
+						info.module = mv.Module
+					}
+					info.symbols = append(info.symbols, syms...)
+					pkgSymbols[pkg] = info
 				}
 			}
 		}
@@ -218,7 +253,7 @@ func (bin *Bin) SBOM() (sbom *govulncheck.SBOM) {
 
 	sbom.GoVersion = bin.GoVersion
 	for _, mod := range bin.Modules {
-		if mod.Replace != nil {
+		if mod.Replace != nil && mod.Replace.Path != "" {
 			mod = mod.Replace
 		}
 		sbom.Modules = append(sbom.Modules, &govulncheck.Module{

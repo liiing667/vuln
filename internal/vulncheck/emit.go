@@ -171,14 +171,14 @@ func modDirWithVendor(modDir, path, module string) string {
 
 func frameFromPackage(pkg *packages.Package) *govulncheck.Frame {
 	fr := &govulncheck.Frame{}
-	if pkg != nil {
+	if pkg != nil && pkg.Module != nil {
 		fr.Module = pkg.Module.Path
 		fr.Version = pkg.Module.Version
 		fr.Package = pkg.PkgPath
-	}
-	if pkg.Module.Replace != nil {
-		fr.Module = pkg.Module.Replace.Path
-		fr.Version = pkg.Module.Replace.Version
+		if r := pkg.Module.Replace; r != nil && r.Path != "" {
+			fr.Module = r.Path
+			fr.Version = r.Version
+		}
 	}
 	return fr
 }
@@ -189,9 +189,9 @@ func frameFromModule(mod *packages.Module) *govulncheck.Frame {
 		Version: mod.Version,
 	}
 
-	if mod.Replace != nil {
-		fr.Module = mod.Replace.Path
-		fr.Version = mod.Replace.Version
+	if r := mod.Replace; r != nil && r.Path != "" {
+		fr.Module = r.Path
+		fr.Version = r.Version
 	}
 
 	return fr

@@ -17,7 +17,7 @@ func FetchVulnerabilities(ctx context.Context, c *client.Client, modules []*pack
 	mreqs := make([]*client.ModuleRequest, len(modules))
 	for i, mod := range modules {
 		modPath := mod.Path
-		if mod.Replace != nil {
+		if mod.Replace != nil && mod.Replace.Path != "" {
 			modPath = mod.Replace.Path
 		}
 		mreqs[i] = &client.ModuleRequest{

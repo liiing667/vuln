@@ -45,26 +45,40 @@ type Symbol struct {
 	Name string `json:"name,omitempty"`
 }
 
+// ErrNotGoBinary indicates that the file is neither a Go binary nor a
+// format that can be inspected for Go build information.
+var ErrNotGoBinary = errors.New("not a Go binary")
+
 // ExtractPackagesAndSymbols extracts symbols, packages, modules from
 // Go binary file as well as bin's metadata.
 //
 // If the symbol table is not available, such as in the case of stripped
 // binaries, returns module and binary info but without the symbol info.
-func ExtractPackagesAndSymbols(file string) ([]*packages.Module, []Symbol, *debug.BuildInfo, error) {
+func ExtractPackagesAndSymbols(file string) (mods []*packages.Module, syms []Symbol, bi *debug.BuildInfo, err error) {
+	// A malformed symbol table can make the PCLN parser panic. Do not let
+	// that escape as a crash, but also do not silently treat the binary as
+	// stripped: report the failure to the caller.
+	defer func() {
+		if r := recover(); r != nil {
+			mods, syms, bi = nil, nil, nil
+			err = fmt.Errorf("extracting symbols from %s: %v", file, r)
+		}
+	}()
+
 	bin, err := os.Open(file)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	defer bin.Close()
 
-	bi, err := buildinfo.Read(bin)
+	bi, err = buildinfo.Read(bin)
 	if err != nil {
 		// It could be that bin is an ancient Go binary.
-		v, err := goversion.ReadExe(file)
-		if err != nil {
-			return nil, nil, nil, err
+		v, gerr := goversion.ReadExe(file)
+		if gerr != nil {
+			return nil, nil, nil, fmt.Errorf("%w: %v", ErrNotGoBinary, gerr)
 		}
-		bi := &debug.BuildInfo{
+		bi = &debug.BuildInfo{
 			GoVersion: v.Release,
 			Main:      debug.Module{Path: v.ModuleInfo},
 		}
@@ -131,12 +145,12 @@ func ExtractPackagesAndSymbols(file string) ([]*packages.Module, []Symbol, *debu
 		}
 	}
 
-	var syms []Symbol
+	var out []Symbol
 	for ps := range pkgSyms {
-		syms = append(syms, ps)
+		out = append(out, ps)
 	}
 
-	return debugModulesToPackagesModules(bi.Deps), syms, bi, nil
+	return debugModulesToPackagesModules(bi.Deps), out, bi, nil
 }
 
 func parseName(s *gosym.Sym) (pkg, sym string, err error) {

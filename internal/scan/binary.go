@@ -60,6 +60,12 @@ func createBin(path string) (*vulncheck.Bin, error) {
 			GOARCH:     findSetting("GOARCH", bi),
 		}, nil
 	}
+	// Only fall back to blob parsing when the file was not a Go binary at
+	// all. If it was a Go binary that we failed to analyze, surface the
+	// error instead of producing an empty (clean) result.
+	if !errors.Is(err, buildinfo.ErrNotGoBinary) {
+		return nil, err
+	}
 
 	// Otherwise, see if the path points to a valid blob.
 	bin := parseBlob(path)
