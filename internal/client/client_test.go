@@ -146,6 +146,48 @@ func TestNewClient(t *testing.T) {
 	})
 }
 
+func TestNewClientRejectsEmptySource(t *testing.T) {
+	for _, src := range []string{"", " ", "/"} {
+		if _, err := NewClient(src, nil); err == nil {
+			t.Errorf("NewClient(%q) succeeded, want error", src)
+		}
+	}
+}
+
+func TestNewInMemoryClientIdentity(t *testing.T) {
+	t.Run("duplicate ID", func(t *testing.T) {
+		entries := []*osv.Entry{
+			{ID: "GO-2026-0001", Modified: time.Unix(1, 0)},
+			{ID: "GO-2026-0001", Modified: time.Unix(2, 0)},
+		}
+		if _, err := NewInMemoryClient(entries); err == nil {
+			t.Fatal("NewInMemoryClient with duplicate IDs succeeded, want error")
+		}
+	})
+
+	t.Run("empty ID", func(t *testing.T) {
+		if _, err := NewInMemoryClient([]*osv.Entry{{Modified: time.Unix(1, 0)}}); err == nil {
+			t.Fatal("NewInMemoryClient with empty ID succeeded, want error")
+		}
+	})
+
+	t.Run("nil entry", func(t *testing.T) {
+		if _, err := NewInMemoryClient([]*osv.Entry{nil}); err == nil {
+			t.Fatal("NewInMemoryClient with nil entry succeeded, want error")
+		}
+	})
+
+	t.Run("valid", func(t *testing.T) {
+		entries, err := entries(testIDs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewInMemoryClient(entries); err != nil {
+			t.Fatalf("NewInMemoryClient with valid entries failed: %v", err)
+		}
+	})
+}
+
 func TestLastModifiedTime(t *testing.T) {
 	test := func(t *testing.T, c *Client) {
 		got, err := c.LastModifiedTime(context.Background())

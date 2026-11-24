@@ -45,12 +45,18 @@ type Options struct {
 // in https://go.dev/security/vuln/database#api.
 func NewClient(source string, opts *Options) (_ *Client, err error) {
 	source = strings.TrimRight(source, "/")
+	if strings.TrimSpace(source) == "" {
+		return nil, errors.New("vulnerability database source is empty")
+	}
 	uri, err := url.Parse(source)
 	if err != nil {
 		return nil, err
 	}
 	switch uri.Scheme {
 	case "http", "https":
+		if uri.Host == "" {
+			return nil, fmt.Errorf("source %q has no host", source)
+		}
 		return newHTTPClient(uri, opts)
 	case "file":
 		return newLocalClient(uri)

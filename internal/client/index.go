@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/vuln/internal/osv"
 	isem "golang.org/x/vuln/internal/semver"
@@ -57,6 +58,10 @@ func indexFromDir(dir string) (map[string][]byte, error) {
 }
 
 func indexFromEntries(entries []*osv.Entry) (map[string][]byte, error) {
+	if err := validateEntries(entries); err != nil {
+		return nil, err
+	}
+
 	idx := newIndex()
 
 	for _, entry := range entries {
@@ -64,6 +69,29 @@ func indexFromEntries(entries []*osv.Entry) (map[string][]byte, error) {
 	}
 
 	return idx.raw()
+}
+
+// validateEntries checks that entries have unique, non-empty IDs.
+//
+// An in-memory database is identified by the set of entries it contains.
+// Allowing two different entries to share an ID would make that identity
+// ambiguous: the index could refer to one entry while the stored data map
+// points at another, and a lookup could silently return stale data.
+func validateEntries(entries []*osv.Entry) error {
+	ids := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("nil OSV entry at index %d", i)
+		}
+		if strings.TrimSpace(entry.ID) == "" {
+			return fmt.Errorf("OSV entry at index %d has an empty ID", i)
+		}
+		if _, ok := ids[entry.ID]; ok {
+			return fmt.Errorf("duplicate vulnerability ID %q", entry.ID)
+		}
+		ids[entry.ID] = struct{}{}
+	}
+	return nil
 }
 
 type index struct {
