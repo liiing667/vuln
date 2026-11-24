@@ -11,6 +11,7 @@ import (
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/vuln/internal"
 	"golang.org/x/vuln/internal/client"
 	"golang.org/x/vuln/internal/govulncheck"
 	"golang.org/x/vuln/internal/osv"
@@ -103,7 +104,10 @@ func source(ctx context.Context, handler govulncheck.Handler, cfg *govulncheck.C
 
 	wg.Wait() // wait for build to finish
 	if buildErr != nil {
-		return nil, err
+		// Do not emit any call findings if the call graph cannot be
+		// built. Returning the error also prevents Source below from
+		// publishing a partial, potentially incorrect, result.
+		return nil, buildErr
 	}
 
 	entryFuncs, callVulns := calledVulnSymbols(entries, affVulns, cg, graph)
@@ -280,6 +284,17 @@ func vulnFuncs(cg *callgraph.Graph, affVulns affectingVulns, graph *PackageGraph
 	m := make(map[*callgraph.Node][]*osv.Entry)
 	for f, n := range cg.Nodes {
 		p := pkgPath(f)
+		if p == internal.UnknownPackagePath {
+			// The package of a call graph node must be known for the
+			// symbol to be attributed correctly. dbFuncName is only
+			// unique within its enclosing package, so matching it
+			// against an unknown (or prefix-guessed) package can
+			// attribute a vulnerable symbol to the wrong package,
+			// e.g. for generic instantiations, init closures, or
+			// same-named receivers. Skip such nodes instead of
+			// emitting a potentially incorrect call finding.
+			continue
+		}
 		vulns := affVulns.ForSymbol(pkgModPath(graph.GetPackage(p)), p, dbFuncName(f))
 		if len(vulns) > 0 {
 			m[n] = vulns

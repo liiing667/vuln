@@ -313,15 +313,20 @@ func modVersion(mod *packages.Module) string {
 // pkgPath returns the path of the f's enclosing package, if any.
 // Otherwise, returns internal.UnknownPackagePath.
 func pkgPath(f *ssa.Function) string {
-	g := f
-	if f.Origin() != nil {
-		// Instantiations of generics do not have
-		// an associated package. We hence look up
-		// the original function for the package.
-		g = f.Origin()
+	// Instantiations of generics, as well as synthetic wrappers
+	// such as thunks and bound method closures, do not have an
+	// associated package. First walk the origin chain to recover the
+	// package of the source-level generic function they derive from.
+	for g := f; g != nil; g = g.Origin() {
+		if g.Package() != nil && g.Package().Pkg != nil {
+			return g.Package().Pkg.Path()
+		}
 	}
-	if g.Package() != nil && g.Package().Pkg != nil {
-		return g.Package().Pkg.Path()
+	// Synthetic thunk and bound method wrappers are not instantiations
+	// and so have no origin, but they retain the typechecker's object
+	// of the wrapped source method, whose package is the real one.
+	if obj := f.Object(); obj != nil && obj.Pkg() != nil {
+		return obj.Pkg().Path()
 	}
 	return internal.UnknownPackagePath
 }

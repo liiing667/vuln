@@ -69,16 +69,57 @@ func emitCallFindings(handler govulncheck.Handler, callstacks map[*Vuln]CallStac
 		if stack == nil {
 			continue
 		}
+		trace := traceFromEntries(stack)
+		if !consistentCallFinding(vuln, trace) {
+			// The module/package/function information of the finding
+			// is not consistent across the result and its trace, which
+			// indicates an unresolved symbol (e.g. a generic wrapper or
+			// a same-named receiver attributed to the wrong package).
+			// Do not publish an incorrect call result.
+			continue
+		}
 		fixed := FixedVersion(modPath(vuln.Package.Module), modVersion(vuln.Package.Module), vuln.OSV.Affected)
 		if err := handler.Finding(&govulncheck.Finding{
 			OSV:          vuln.OSV.ID,
 			FixedVersion: fixed,
-			Trace:        traceFromEntries(stack),
+			Trace:        trace,
 		}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// consistentCallFinding reports whether the module, package, and
+// function of the vulnerable symbol in vuln are consistent with the
+// sink (first) frame of its emitted trace. A finding whose parts cannot
+// be related to the same package is dropped instead of being published.
+func consistentCallFinding(vuln *Vuln, trace []*govulncheck.Frame) bool {
+	if vuln == nil || vuln.Package == nil || vuln.CallSink == nil || len(trace) == 0 {
+		return false
+	}
+	sink := trace[0]
+	if sink == nil {
+		return false
+	}
+
+	// The sink frame has to describe the same package as the finding.
+	mod := modPath(vuln.Package.Module)
+	if sink.Module != mod || sink.Package != vuln.Package.PkgPath {
+		return false
+	}
+
+	// The sink frame has to describe the same function as the call
+	// sink. The frame's function and receiver fields are derived from
+	// the function node directly (see traceFromEntries and
+	// FuncNode.Receiver), so compare against those rather than the
+	// database symbol string, which encodes generic methods using the
+	// base receiver name only (e.g. Wrap.M vs Wrap[int].M).
+	fn := vuln.CallSink
+	if sink.Function != fn.Name {
+		return false
+	}
+	return sink.Receiver == fn.Receiver()
 }
 
 // traceFromEntries creates a sequence of
