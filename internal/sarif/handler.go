@@ -28,6 +28,9 @@ type handler struct {
 	// an osv is indeed called, then all findings for
 	// the osv will have call stack info.
 	findings map[string][]*govulncheck.Finding
+	// err binds a failure to any partial output produced by Flush so
+	// the same failure is reported rather than a successful empty run.
+	err error
 }
 
 func NewHandler(w io.Writer) *handler {
@@ -37,6 +40,15 @@ func NewHandler(w io.Writer) *handler {
 		findings: make(map[string][]*govulncheck.Finding),
 	}
 }
+
+// handler participates in govulncheck.HandleJSON's failure binding: a
+// stream failure is bound to the buffered partial output via BindError,
+// reported by Flush, and discarded by Reset so the next scan starts empty.
+var _ interface {
+	Flush() error
+	BindError(error)
+	Reset()
+} = (*handler)(nil)
 
 func (h *handler) Config(c *govulncheck.Config) error {
 	h.cfg = c
@@ -110,13 +122,39 @@ func (h *handler) Finding(f *govulncheck.Finding) error {
 // Flush is used to print out to w the sarif json output.
 // This is needed as sarif is not streamed.
 func (h *handler) Flush() error {
+	if h.err != nil {
+		return h.err
+	}
 	sLog := toSarif(h)
 	s, err := json.MarshalIndent(sLog, "", "  ")
 	if err != nil {
+		h.err = err
 		return err
 	}
-	h.w.Write(s)
+	if _, err := h.w.Write(s); err != nil {
+		h.err = err
+		return err
+	}
 	return nil
+}
+
+// Reset discards all messages buffered for the current scan so the next
+// scan starts from an empty state after a failed or partial stream.
+func (h *handler) Reset() {
+	h.cfg = nil
+	h.osvs = make(map[string]*osv.Entry)
+	h.findings = make(map[string][]*govulncheck.Finding)
+	h.err = nil
+}
+
+// BindError attaches a stream-level failure (for instance a JSON decode
+// error or a handler method failure) to the partial output buffered so
+// far, so Flush reports the failure instead of a misleading success.
+// The first bound failure is retained.
+func (h *handler) BindError(err error) {
+	if h.err == nil && err != nil {
+		h.err = err
+	}
 }
 
 func toSarif(h *handler) Log {

@@ -33,6 +33,15 @@ func NewTextHandler(w io.Writer) *TextHandler {
 	return &TextHandler{w: w}
 }
 
+// TextHandler participates in HandleJSON's failure binding: a stream
+// failure is bound to the partial text output via BindError, reported by
+// Flush, and discarded by Reset so the next scan starts empty.
+var _ interface {
+	Flush() error
+	BindError(error)
+	Reset()
+} = (*TextHandler)(nil)
+
 type TextHandler struct {
 	w         io.Writer
 	sbom      *govulncheck.SBOM
@@ -85,6 +94,29 @@ func (h *TextHandler) Flush() error {
 	}
 
 	return nil
+}
+
+// Reset discards all messages and the bound write failure accumulated for
+// the current scan, so the next scan starts from an empty state and cannot
+// mix findings with a previous partial output. Output presentation options
+// configured on the handler are preserved.
+func (h *TextHandler) Reset() {
+	h.sbom = nil
+	h.osvs = nil
+	h.findings = nil
+	h.scanLevel = ""
+	h.scanMode = ""
+	h.err = nil
+}
+
+// BindError attaches a stream-level failure (for instance a JSON decode
+// error or a handler method failure) to the partial output emitted so far,
+// so Flush reports the failure instead of a misleading successful summary.
+// The first bound failure is retained.
+func (h *TextHandler) BindError(err error) {
+	if h.err == nil && err != nil {
+		h.err = err
+	}
 }
 
 // Config writes version information only if --version was set.
