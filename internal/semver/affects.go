@@ -35,11 +35,13 @@ func Affects(a []osv.Range, v string) bool {
 // ContainsSemver checks if semver version v is in the
 // range encoded by ar. If ar is not a semver range,
 // returns false. A range is interpreted as a left-closed
-// and right-open interval.
+// and right-open interval. Events are normalized on a copy,
+// so reordered events produce the same result without changing
+// the caller's OSV value.
 //
 // Assumes that
 //   - exactly one of Introduced or Fixed fields is set
-//   - ranges in ar are not overlapping
+//   - valid ranges in ar do not overlap
 //   - beginning of time is encoded with .Introduced="0"
 //   - no-fix is not an event, as opposed to being an
 //     event where Introduced="" and Fixed=""
@@ -55,34 +57,13 @@ func ContainsSemver(ar osv.Range, v string) bool {
 	// versions prefixed with 'v', and versions prefixed with 'go'.
 	v = canonicalizeSemverPrefix(v)
 
-	// Sort events by semver versions. Event for beginning
-	// of time, if present, always comes first.
-	sort.SliceStable(ar.Events, func(i, j int) bool {
-		e1 := ar.Events[i]
-		v1 := e1.Introduced
-		if v1 == "0" {
-			// -inf case.
-			return true
-		}
-		if e1.Fixed != "" {
-			v1 = e1.Fixed
-		}
-
-		e2 := ar.Events[j]
-		v2 := e2.Introduced
-		if v2 == "0" {
-			// -inf case.
-			return false
-		}
-		if e2.Fixed != "" {
-			v2 = e2.Fixed
-		}
-
-		return Less(v1, v2)
-	})
+	// Work on a copy. Sorting ar.Events in place would make a query
+	// observable through the caller's OSV value and could change later
+	// calls made by NonSupersededFix or client indexing.
+	events := sortedEvents(ar.Events)
 
 	var affected bool
-	for _, e := range ar.Events {
+	for _, e := range events {
 		if !affected && e.Introduced != "" {
 			affected = e.Introduced == "0" || !Less(v, e.Introduced)
 		} else if affected && e.Fixed != "" {
@@ -91,4 +72,56 @@ func ContainsSemver(ar osv.Range, v string) bool {
 	}
 
 	return affected
+}
+
+// sortedEvents returns a sorted copy of events. "0" is the beginning of
+// time. At equal versions, fixed events come before introduced events so
+// that adjacent intervals such as [a, b) and [b, c) include b in the
+// latter interval.
+func sortedEvents(events []osv.RangeEvent) []osv.RangeEvent {
+	sorted := append([]osv.RangeEvent(nil), events...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		e1, e2 := sorted[i], sorted[j]
+		if c := compareEventVersions(eventVersion(e1), eventVersion(e2)); c != 0 {
+			return c < 0
+		}
+		return isFixedOnlyEvent(e1) && isIntroducedOnlyEvent(e2)
+	})
+	return sorted
+}
+
+// eventVersion returns the version carried by e.
+func eventVersion(e osv.RangeEvent) string {
+	if e.Introduced != "" {
+		return e.Introduced
+	}
+	return e.Fixed
+}
+
+func isFixedOnlyEvent(e osv.RangeEvent) bool {
+	return e.Fixed != "" && e.Introduced == ""
+}
+
+func isIntroducedOnlyEvent(e osv.RangeEvent) bool {
+	return e.Introduced != "" && e.Fixed == ""
+}
+
+// compareEventVersions orders event versions. The special introduced
+// version "0" represents the beginning of time and sorts before all
+// ordinary semver versions.
+func compareEventVersions(v1, v2 string) int {
+	switch {
+	case v1 == "0" && v2 == "0":
+		return 0
+	case v1 == "0":
+		return -1
+	case v2 == "0":
+		return 1
+	case Less(v1, v2):
+		return -1
+	case Less(v2, v1):
+		return 1
+	default:
+		return 0
+	}
 }
