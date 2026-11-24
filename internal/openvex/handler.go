@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"golang.org/x/vuln/internal/govulncheck"
@@ -30,11 +31,13 @@ type handler struct {
 	cfg  *govulncheck.Config
 	sbom *govulncheck.SBOM
 	osvs map[string]*osv.Entry
-	// findings contains same-level findings for an
-	// OSV at the most precise level of granularity
-	// available. This means, for instance, that if
-	// an osv is indeed called, then all findings for
-	// the osv will have call stack info.
+	// findings contains, per OSV, the most precise finding
+	// available for each affected subcomponent (identified by
+	// its PURL). A more precise finding for one subcomponent
+	// therefore never erases findings for the other
+	// subcomponents of the same OSV. For instance, if an osv
+	// is called in one module but only required through
+	// another, both modules are retained.
 	findings map[string][]*govulncheck.Finding
 }
 
@@ -103,26 +106,38 @@ func moreSpecific(f1, f2 *govulncheck.Finding) int {
 		return -1
 	}
 	if fr1.Package == "" && fr2.Package != "" {
-		return -1
+		return 1
 	}
 	return 0 // findings always have module info
 }
 
 func (h *handler) Finding(f *govulncheck.Finding) error {
+	purl := purlFromFinding(f)
 	fs := h.findings[f.OSV]
-	if len(fs) == 0 {
-		fs = []*govulncheck.Finding{f}
-	} else {
-		if ms := moreSpecific(f, fs[0]); ms == -1 {
-			// The new finding is more specific, so we need
-			// to erase existing findings and add the new one.
-			fs = []*govulncheck.Finding{f}
-		} else if ms == 0 {
+	for i, existing := range fs {
+		if purlFromFinding(existing) != purl {
+			continue
+		}
+
+		// The finding belongs to a subcomponent we already know
+		// about, so only the most precise finding for that
+		// subcomponent is kept. Findings for other subcomponents
+		// are left untouched.
+		switch moreSpecific(f, existing) {
+		case -1:
+			// The new finding is more specific, so it replaces
+			// the less precise finding for this subcomponent.
+			fs[i] = f
+		case 0:
 			// The new finding is at the same level of precision.
 			fs = append(fs, f)
 		}
-		// Otherwise, the new finding is at a less precise level.
+		h.findings[f.OSV] = fs
+		return nil
 	}
+
+	// This is the first finding for the subcomponent.
+	fs = append(fs, f)
 	h.findings[f.OSV] = fs
 	return nil
 }
@@ -155,25 +170,28 @@ func toVex(h *handler) Document {
 }
 
 // Given a slice of findings, returns those findings as a set of subcomponents
-// that are unique per the vulnerable artifact's PURL.
+// that are unique per the vulnerable artifact's PURL. The subcomponents are
+// sorted by PURL so that the generated VEX document is deterministic and
+// independent of the order in which findings were emitted.
 func subcomponentSet(findings []*govulncheck.Finding) []Component {
 	var scs []Component
 	seen := make(map[string]bool)
 	for _, f := range findings {
 		purl := purlFromFinding(f)
 		if !seen[purl] {
-			scs = append(scs, Component{
-				ID: purlFromFinding(f),
-			})
+			scs = append(scs, Component{ID: purl})
 			seen[purl] = true
 		}
 	}
+	slices.SortFunc(scs, func(a, b Component) int {
+		return strings.Compare(a.ID, b.ID)
+	})
 	return scs
 }
 
 // statements combines all OSVs found by govulncheck and generates the list of
 // vex statements with the proper affected level and justification to match the
-// openVex specification.
+// openVEX specification.
 func statements(h *handler) []Statement {
 	var scanLevel findingLevel
 	switch h.cfg.ScanLevel {
@@ -192,54 +210,79 @@ func statements(h *handler) []Statement {
 		if len(h.findings[id]) == 0 {
 			continue
 		}
-		description := osv.Summary
-		if description == "" {
-			description = osv.Details
-		}
 
-		s := Statement{
-			Vulnerability: Vulnerability{
-				ID:          fmt.Sprintf("https://pkg.go.dev/vuln/%s", id),
-				Name:        id,
-				Description: description,
-				Aliases:     osv.Aliases,
-			},
-			Products: []Product{
-				{
-					Component:     Component{ID: DefaultPID},
-					Subcomponents: subcomponentSet(h.findings[id]),
-				},
-			},
+		// Group findings by the level at which they are present in the
+		// scanned product. Findings for the same OSV can come from
+		// different subcomponents at different levels (e.g. the vulnerable
+		// code is called in one module but only imported through another),
+		// and each level maps to a different VEX status. Every statement
+		// therefore covers subcomponents sharing the same status.
+		findingsByLevel := make(map[findingLevel][]*govulncheck.Finding)
+		for _, f := range h.findings[id] {
+			level := foundAtLevel(f)
+			findingsByLevel[level] = append(findingsByLevel[level], f)
 		}
+		var levels []findingLevel
+		for level := range findingsByLevel {
+			levels = append(levels, level)
+		}
+		slices.Sort(levels)
 
-		// Findings are guaranteed to be at the same level, so we can just check the first element
-		fLevel := foundAtLevel(h.findings[id][0])
-		if fLevel >= scanLevel {
-			s.Status = StatusAffected
-		} else {
-			s.Status = StatusNotAffected
-			s.ImpactStatement = Impact
-			s.Justification = JustificationNotPresent
-			// We only reach this case if running in symbol mode
-			if fLevel == imported {
-				s.Justification = JustificationNotExecuted
-			}
+		for _, level := range levels {
+			statements = append(statements,
+				h.statement(id, osv, findingsByLevel[level], level, scanLevel))
 		}
-		statements = append(statements, s)
 	}
 
 	slices.SortFunc(statements, func(a, b Statement) int {
-		if a.Vulnerability.ID > b.Vulnerability.ID {
-			return 1
+		if c := strings.Compare(a.Vulnerability.ID, b.Vulnerability.ID); c != 0 {
+			return c
 		}
-		if a.Vulnerability.ID < b.Vulnerability.ID {
-			return -1
-		}
-		// this should never happen in practice, since statements are being
-		// populated from a map with the vulnerability IDs as keys
-		return 0
+		// Statements for the same OSV are ordered by the status
+		// of their subcomponents.
+		return strings.Compare(a.Status, b.Status)
 	})
 	return statements
+}
+
+// statement builds a single VEX statement for the given OSV from the findings
+// of subcomponents that are all present at the same finding level. The status
+// is derived from that level relative to the scan level, so every
+// subcomponent listed in the statement shares an identical status.
+func (h *handler) statement(id string, osv *osv.Entry, levelFindings []*govulncheck.Finding,
+	level, scanLevel findingLevel) Statement {
+	description := osv.Summary
+	if description == "" {
+		description = osv.Details
+	}
+
+	s := Statement{
+		Vulnerability: Vulnerability{
+			ID:          fmt.Sprintf("https://pkg.go.dev/vuln/%s", id),
+			Name:        id,
+			Description: description,
+			Aliases:     osv.Aliases,
+		},
+		Products: []Product{
+			{
+				Component:     Component{ID: DefaultPID},
+				Subcomponents: subcomponentSet(levelFindings),
+			},
+		},
+	}
+
+	if level >= scanLevel {
+		s.Status = StatusAffected
+	} else {
+		s.Status = StatusNotAffected
+		s.ImpactStatement = Impact
+		s.Justification = JustificationNotPresent
+		// We only reach this case if running in symbol mode
+		if level == imported {
+			s.Justification = JustificationNotExecuted
+		}
+	}
+	return s
 }
 
 func hashVex(doc Document) string {
