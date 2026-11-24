@@ -23,7 +23,7 @@ type PackageGraph struct {
 	// topPkgs are top-level packages specified by the user.
 	// Empty in binary mode.
 	topPkgs  []*packages.Package
-	modules  map[string]*packages.Module  // all modules (even replacing ones)
+	modules  map[string]*packages.Module  // all modules in the build list
 	packages map[string]*packages.Package // all packages (even dependencies)
 }
 
@@ -106,9 +106,14 @@ func (g *PackageGraph) Modules() []*packages.Module {
 	return mods
 }
 
-// AddModules adds the modules and any replace modules provided.
-// It will ignore modules that have duplicate paths to ones the
-// graph already holds.
+// AddModules adds the modules to the graph. It will ignore modules
+// that have duplicate paths to ones the graph already holds.
+//
+// Modules that are targets of a replace directive are not added:
+// a replace directive substitutes the source of a module, not its
+// identity in the build list. Adding them would merge distinct
+// artifacts sharing a path and produce duplicate module identities
+// in the graph.
 func (g *PackageGraph) AddModules(mods ...*packages.Module) {
 	for _, mod := range mods {
 		if _, found := g.modules[mod.Path]; found {
@@ -116,9 +121,6 @@ func (g *PackageGraph) AddModules(mods ...*packages.Module) {
 			continue
 		}
 		g.modules[mod.Path] = mod
-		if mod.Replace != nil {
-			g.AddModules(mod.Replace)
-		}
 	}
 }
 
@@ -255,25 +257,30 @@ func (e *packageError) Error() string {
 
 func (g *PackageGraph) SBOM() *govulncheck.SBOM {
 	getMod := func(mod *packages.Module) *govulncheck.Module {
-		if mod.Replace != nil {
-			return &govulncheck.Module{
-				Path:    mod.Replace.Path,
-				Version: mod.Replace.Version,
-			}
-		}
-
 		return &govulncheck.Module{
-			Path:    mod.Path,
-			Version: mod.Version,
+			Path:    modPath(mod),
+			Version: modVersion(mod),
 		}
+	}
+	// modID identifies a module identity. Modules with distinct
+	// identities are distinct artifacts and must not be merged,
+	// whereas the same identity can be reached through different
+	// graph nodes, say a module and the target of its replace
+	// directive, and should be reported only once.
+	modID := func(mod *govulncheck.Module) string {
+		return mod.Path + "\x00" + mod.Version
 	}
 
 	var roots []string
+	seenRoots := make(map[string]bool)
 	rootMods := make(map[string]*govulncheck.Module)
 	for _, pkg := range g.TopPkgs() {
-		roots = append(roots, pkg.PkgPath)
+		if !seenRoots[pkg.PkgPath] {
+			seenRoots[pkg.PkgPath] = true
+			roots = append(roots, pkg.PkgPath)
+		}
 		mod := getMod(pkg.Module)
-		rootMods[mod.Path] = mod
+		rootMods[modID(mod)] = mod
 	}
 
 	// Govulncheck attempts to put the modules that correspond to the matched package patterns (i.e. the root modules)
@@ -281,16 +288,22 @@ func (g *PackageGraph) SBOM() *govulncheck.SBOM {
 	// Note: This does not guarantee that the first element is the root module.
 	var topMods, depMods []*govulncheck.Module
 	var goVersion string
+	seenMods := make(map[string]bool)
 	for _, mod := range g.Modules() {
-		mod := getMod(mod)
+		gmod := getMod(mod)
+		id := modID(gmod)
+		if seenMods[id] {
+			continue
+		}
+		seenMods[id] = true
 
-		if mod.Path == internal.GoStdModulePath {
-			goVersion = semver.SemverToGoTag(mod.Version)
+		if gmod.Path == internal.GoStdModulePath {
+			goVersion = semver.SemverToGoTag(gmod.Version)
 		}
 
 		// if the mod is not associated with a root package, add it to depMods
-		if rootMods[mod.Path] == nil {
-			depMods = append(depMods, mod)
+		if rootMods[id] == nil {
+			depMods = append(depMods, gmod)
 		}
 	}
 
@@ -310,9 +323,12 @@ func (g *PackageGraph) SBOM() *govulncheck.SBOM {
 	}
 }
 
-// Sorts modules alphabetically by path.
+// Sorts modules alphabetically by path and version.
 func sortMods(mods []*govulncheck.Module) {
 	slices.SortFunc(mods, func(a, b *govulncheck.Module) int {
-		return strings.Compare(a.Path, b.Path)
+		if c := strings.Compare(a.Path, b.Path); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Version, b.Version)
 	})
 }

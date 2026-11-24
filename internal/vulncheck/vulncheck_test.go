@@ -302,7 +302,8 @@ func TestVulnsForPackageReplaced(t *testing.T) {
 			Module: &packages.Module{
 				Path: "example.mod/a/b",
 				Replace: &packages.Module{
-					Path: "example.mod/b",
+					Path:    "example.mod/b",
+					Version: "v1.0.1",
 				},
 				Version: "v1.0.0",
 			},

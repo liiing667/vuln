@@ -296,18 +296,44 @@ func fixNegated(fix string, affected []osv.Affected) bool {
 	return false
 }
 
+// modPath returns the module path identifying mod in the package
+// graph and, hence, in govulncheck reports. If mod is replaced by
+// another versioned module, the replacement path is returned since
+// that is the module whose source is actually compiled and analyzed.
+// A local directory replacement does not have a module identity of
+// its own, so the original module path is kept.
 func modPath(mod *packages.Module) string {
-	if mod.Replace != nil {
+	if versionedReplace(mod) {
 		return mod.Replace.Path
 	}
 	return mod.Path
 }
 
+// modVersion returns the module version identifying mod in the
+// package graph and, hence, in govulncheck reports. If mod is
+// replaced by another versioned module, the replacement version is
+// returned since that is the version whose source is actually
+// compiled and analyzed. Otherwise, the module's own version is
+// returned, even if empty, so that the version of a module in the
+// build list is never lost.
 func modVersion(mod *packages.Module) string {
-	if mod.Replace != nil {
+	if versionedReplace(mod) {
 		return mod.Replace.Version
 	}
 	return mod.Version
+}
+
+// versionedReplace reports whether mod is replaced by another
+// versioned module, as opposed to a local directory. A local
+// directory replacement has no module version: it is "" for modules
+// loaded from source and "(devel)" for modules of a stripped
+// binary build info.
+func versionedReplace(mod *packages.Module) bool {
+	if mod.Replace == nil {
+		return false
+	}
+	v := mod.Replace.Version
+	return v != "" && v != "(devel)"
 }
 
 // pkgPath returns the path of the f's enclosing package, if any.

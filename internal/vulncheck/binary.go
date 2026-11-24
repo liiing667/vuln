@@ -208,23 +208,32 @@ func allKnownVulnerableSymbols(affVulns affectingVulns) map[string][]string {
 
 func (bin *Bin) SBOM() (sbom *govulncheck.SBOM) {
 	sbom = &govulncheck.SBOM{}
+	// seen tracks module identities already present in the SBOM so
+	// that distinct artifacts are listed, but never more than once.
+	seen := make(map[string]bool)
+	addModule := func(path, version string) {
+		id := path + "\x00" + version
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		sbom.Modules = append(sbom.Modules, &govulncheck.Module{
+			Path:    path,
+			Version: version,
+		})
+	}
+
 	if bin.Main != nil {
 		sbom.Roots = []string{bin.Main.Path}
-		sbom.Modules = append(sbom.Modules, &govulncheck.Module{
-			Path:    bin.Main.Path,
-			Version: bin.Main.Version,
-		})
+		addModule(bin.Main.Path, bin.Main.Version)
 	}
 
 	sbom.GoVersion = bin.GoVersion
 	for _, mod := range bin.Modules {
-		if mod.Replace != nil {
-			mod = mod.Replace
+		if mod == nil {
+			continue
 		}
-		sbom.Modules = append(sbom.Modules, &govulncheck.Module{
-			Path:    mod.Path,
-			Version: mod.Version,
-		})
+		addModule(modPath(mod), modVersion(mod))
 	}
 
 	// add stdlib to mirror source mode output

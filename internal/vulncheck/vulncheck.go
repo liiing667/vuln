@@ -127,11 +127,12 @@ func affectingVulnerabilities(vulns []*ModVulns, os, arch string) affectingVulns
 	var filtered affectingVulns
 	for _, mod := range vulns {
 		module := mod.Module
-		modVersion := module.Version
-		if module.Replace != nil {
-			modVersion = module.Replace.Version
-		}
-		// TODO(https://golang.org/issues/49264): if modVersion == "", try vcs?
+		// Use the same module identity as the one used for fetching
+		// vulnerabilities and for reporting, so that findings stay
+		// consistent with the package graph.
+		mPath := modPath(module)
+		mVersion := modVersion(module)
+		// TODO(https://golang.org/issues/49264): if mVersion == "", try vcs?
 		var filteredVulns []*osv.Entry
 		for _, v := range mod.Vulns {
 			// Ignore vulnerabilities that have been withdrawn
@@ -147,10 +148,10 @@ func affectingVulnerabilities(vulns []*ModVulns, os, arch string) affectingVulns
 				// information out as it might lead to incorrect results:
 				// Computing a latest fix could consider versions of these
 				// different packages.
-				if a.Module.Path != module.Path {
+				if a.Module.Path != mPath {
 					continue
 				}
-				if !affected(modVersion, a) {
+				if !affected(mVersion, a) {
 					continue
 				}
 
@@ -268,10 +269,7 @@ func (aff affectingVulns) ForPackage(module, importPath string) []*osv.Entry {
 		return nil
 	}
 
-	if mod.Module.Replace != nil {
-		// standard libraries do not have a module nor replace module
-		importPath = fmt.Sprintf("%s%s", mod.Module.Replace.Path, strings.TrimPrefix(importPath, mod.Module.Path))
-	}
+	importPath = dbImportPath(mod.Module, importPath)
 	vulns := mod.Vulns
 	packageVulns := []*osv.Entry{}
 Vuln:
@@ -301,6 +299,11 @@ func (aff affectingVulns) ForSymbol(module, importPath, symbol string) []*osv.En
 		return nil
 	}
 
+	// Match symbols using the same import path identity as ForPackage.
+	if mod := aff.moduleVulns(module, importPath); mod != nil {
+		importPath = dbImportPath(mod.Module, importPath)
+	}
+
 	symbolVulns := []*osv.Entry{}
 vulnLoop:
 	for _, v := range vulns {
@@ -324,6 +327,19 @@ vulnLoop:
 		}
 	}
 	return symbolVulns
+}
+
+// dbImportPath returns the import path of a package as it appears in
+// the vulnerability database for mod. If mod is replaced by another
+// versioned module, the vulnerable packages of the replacement are
+// rooted at the replacement module path, so importPath is rewritten
+// accordingly. Otherwise, importPath is returned unchanged.
+func dbImportPath(mod *packages.Module, importPath string) string {
+	// standard libraries do not have a module nor replace module
+	if versionedReplace(mod) {
+		return fmt.Sprintf("%s%s", mod.Replace.Path, strings.TrimPrefix(importPath, mod.Path))
+	}
+	return importPath
 }
 
 func contains(symbols []string, target string) bool {
