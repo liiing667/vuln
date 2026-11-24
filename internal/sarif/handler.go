@@ -6,6 +6,7 @@ package sarif
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -81,7 +82,7 @@ func moreSpecific(f1, f2 *govulncheck.Finding) int {
 		return -1
 	}
 	if fr1.Package == "" && fr2.Package != "" {
-		return -1
+		return 1
 	}
 	return 0 // findings always have module info
 }
@@ -110,13 +111,74 @@ func (h *handler) Finding(f *govulncheck.Finding) error {
 // Flush is used to print out to w the sarif json output.
 // This is needed as sarif is not streamed.
 func (h *handler) Flush() error {
+	// Validate that the rule, result, and location identities of the
+	// accumulated stream are closed before producing any output. This
+	// guarantees a SARIF document where every result references an
+	// existing rule and every rule is backed by a result, and that the
+	// location invariants of the scan mode hold. Nothing is written when
+	// validation fails, so callers never observe a partial document.
+	if err := h.validate(); err != nil {
+		return err
+	}
 	sLog := toSarif(h)
 	s, err := json.MarshalIndent(sLog, "", "  ")
 	if err != nil {
 		return err
 	}
-	h.w.Write(s)
+	if _, err := h.w.Write(s); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validate checks that the messages consumed so far form a closed set of
+// SARIF rules, results, and locations.
+//
+// A finding references an OSV by ID. The corresponding OSV message has to
+// have been emitted for a rule describing that result to exist; several
+// findings for the same OSV collapse into a single result. Locations are
+// mode-specific: source results are attached to go.mod, while binary
+// results must not carry source locations.
+func (h *handler) validate() error {
+	if h.cfg == nil {
+		return errors.New("sarif: missing config message")
+	}
+
+	var errs []error
+	// rules() and results() are both derived from h.findings, keyed by OSV
+	// ID. A rule can therefore only exist when an OSV message for that ID was
+	// emitted, and every rule has exactly one result with the same ruleId.
+	for id, fs := range h.findings {
+		if _, ok := h.osvs[id]; !ok {
+			errs = append(errs, fmt.Errorf("sarif: finding for %q has no matching OSV entry", id))
+		}
+		if len(fs) == 0 {
+			errs = append(errs, fmt.Errorf("sarif: result for %q has no findings", id))
+			continue
+		}
+		for i, f := range fs {
+			if f == nil || len(f.Trace) == 0 {
+				errs = append(errs, fmt.Errorf("sarif: finding %d for %q has an empty trace", i, id))
+				continue
+			}
+			// In binary mode positions are not available, so call-stack frames
+			// cannot carry physical locations. In every other mode, frame
+			// positions must resolve to a portable artifact location.
+			for j, frame := range f.Trace {
+				if frame == nil {
+					errs = append(errs, fmt.Errorf("sarif: frame %d of finding %d for %q is nil", j, i, id))
+					continue
+				}
+				if h.cfg.ScanMode == govulncheck.ScanModeBinary {
+					if frame.Position != nil && frame.Position.Filename != "" {
+						errs = append(errs, fmt.Errorf("sarif: binary finding for %q must not reference source file %q", id, frame.Position.Filename))
+					}
+				}
+			}
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 func toSarif(h *handler) Log {

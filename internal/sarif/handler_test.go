@@ -5,11 +5,14 @@
 package sarif
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/vuln/internal/govulncheck"
+	"golang.org/x/vuln/internal/osv"
 )
 
 func scanLevel(f *govulncheck.Finding) string {
@@ -286,6 +289,12 @@ func TestMoreSpecific(t *testing.T) {
 			[]*govulncheck.Frame{
 				frame("m1", "", "")},
 		},
+		{"mod-vs-pkg", 1,
+			[]*govulncheck.Frame{
+				frame("m1", "", "")},
+			[]*govulncheck.Frame{
+				frame("m1", "p1", "")},
+		},
 		{"mod-vs-sym", 1,
 			[]*govulncheck.Frame{
 				frame("m1", "", "")},
@@ -345,5 +354,205 @@ func TestResultMessage(t *testing.T) {
 		if tc.want != got {
 			t.Errorf("want %s; got %s", tc.want, got)
 		}
+	}
+}
+
+func testEntry(id string) *osv.Entry {
+	return &osv.Entry{
+		ID:      id,
+		Summary: "summary of " + id,
+		Details: "details of " + id,
+	}
+}
+
+func moduleFinding(id, module string) *govulncheck.Finding {
+	return &govulncheck.Finding{
+		OSV: id,
+		Trace: []*govulncheck.Frame{
+			{Module: module},
+		},
+	}
+}
+
+// TestFlushMissingOSV ensures that a finding whose OSV entry was never
+// emitted prevents Flush from producing a document: without the entry there
+// is no rule backing the result, and the old code panicked on a nil entry.
+func TestFlushMissingOSV(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&buf)
+	if err := h.Config(&govulncheck.Config{ScanMode: govulncheck.ScanModeSource}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Finding(moduleFinding("GO-2021-0054", "example.com/m")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Flush(); err == nil {
+		t.Fatal("Flush succeeded without an OSV entry for the finding")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("Flush wrote a partial document (%d bytes) after failing", buf.Len())
+	}
+}
+
+// TestFlushClosedIdentities verifies the happy path: one rule and one result
+// per OSV, with a go.mod location in source mode, yields a complete document.
+func TestFlushClosedIdentities(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&buf)
+	if err := h.Config(&govulncheck.Config{ScanMode: govulncheck.ScanModeSource}); err != nil {
+		t.Fatal(err)
+	}
+	const id = "GO-2021-0054"
+	if err := h.OSV(testEntry(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Finding(moduleFinding(id, "example.com/m")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	var log Log
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatalf("invalid SARIF json: %v", err)
+	}
+	if len(log.Runs) != 1 {
+		t.Fatalf("want 1 run, got %d", len(log.Runs))
+	}
+	run := log.Runs[0]
+	if len(run.Tool.Driver.Rules) != 1 || run.Tool.Driver.Rules[0].ID != id {
+		t.Fatalf("rules do not match the single OSV: %+v", run.Tool.Driver.Rules)
+	}
+	if len(run.Results) != 1 || run.Results[0].RuleID != id {
+		t.Fatalf("results do not match the single OSV: %+v", run.Results)
+	}
+	locs := run.Results[0].Locations
+	if len(locs) != 1 || locs[0].PhysicalLocation.ArtifactLocation.URI != "go.mod" {
+		t.Fatalf("source result must be attached to go.mod: %+v", locs)
+	}
+}
+
+// TestFlushBinaryMode ensures binary findings, which carry no positions,
+// flush successfully and produce results without physical locations.
+func TestFlushBinaryMode(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&buf)
+	if err := h.Config(&govulncheck.Config{ScanMode: govulncheck.ScanModeBinary}); err != nil {
+		t.Fatal(err)
+	}
+	const id = "GO-2021-0054"
+	if err := h.OSV(testEntry(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Finding(&govulncheck.Finding{
+		OSV: id,
+		Trace: []*govulncheck.Frame{
+			{Module: "example.com/m", Version: "v1.0.0", Package: "example.com/m/p", Function: "Vuln"},
+			{Module: "example.com/main", Package: "example.com/main", Function: "main"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	var log Log
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatalf("invalid SARIF json: %v", err)
+	}
+	run := log.Runs[0]
+	if len(run.Tool.Driver.Rules) != 1 || len(run.Results) != 1 {
+		t.Fatalf("want 1 rule and 1 result, got %d rules, %d results",
+			len(run.Tool.Driver.Rules), len(run.Results))
+	}
+	if got := run.Results[0].RuleID; got != id {
+		t.Fatalf("result ruleId = %q, want %q", got, id)
+	}
+	if len(run.Results[0].Locations) != 0 {
+		t.Fatalf("binary result must not carry locations, got %+v", run.Results[0].Locations)
+	}
+	for _, st := range run.Results[0].Stacks {
+		for _, fr := range st.Frames {
+			if fr.Location.PhysicalLocation.ArtifactLocation.URI != "" {
+				t.Fatalf("binary stack frame must not reference a source file: %+v", fr)
+			}
+		}
+	}
+}
+
+// TestFlushBinaryFindingWithPosition rejects a binary finding that
+// unexpectedly carries source position information.
+func TestFlushBinaryFindingWithPosition(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&buf)
+	if err := h.Config(&govulncheck.Config{ScanMode: govulncheck.ScanModeBinary}); err != nil {
+		t.Fatal(err)
+	}
+	const id = "GO-2021-0054"
+	if err := h.OSV(testEntry(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Finding(&govulncheck.Finding{
+		OSV: id,
+		Trace: []*govulncheck.Frame{{
+			Module:   "example.com/m",
+			Position: &govulncheck.Position{Filename: "vuln.go", Line: 10},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Flush(); err == nil {
+		t.Fatal("Flush succeeded for a binary finding with a source position")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("Flush wrote a partial document (%d bytes) after failing", buf.Len())
+	}
+}
+
+// TestFlushMissingConfig ensures Flush without a Config message fails
+// instead of dereferencing a nil config while building the document.
+func TestFlushMissingConfig(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(&buf)
+	if err := h.OSV(testEntry("GO-2021-0054")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(); err == nil {
+		t.Fatal("Flush succeeded without a config message")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("Flush wrote a partial document (%d bytes) after failing", buf.Len())
+	}
+}
+
+// TestFindingSpecificityOrdering exercises the moreSpecific comparison when
+// the less specific module finding arrives after a package finding. The
+// package-level finding must be retained rather than replaced.
+func TestFindingSpecificityOrdering(t *testing.T) {
+	const id = "GO-2021-0054"
+	h := newTestHandler()
+	h.cfg.ScanMode = govulncheck.ScanModeSource
+
+	pkg := &govulncheck.Finding{OSV: id, Trace: []*govulncheck.Frame{
+		{Module: "example.com/m", Package: "example.com/m/p"},
+	}}
+	mod := moduleFinding(id, "example.com/m")
+
+	if err := h.Finding(pkg); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Finding(mod); err != nil {
+		t.Fatal(err)
+	}
+
+	got := h.findings[id]
+	if len(got) != 1 || got[0].Trace[0].Package == "" {
+		t.Fatalf("package-level finding was replaced by the module-level finding: %+v", got)
 	}
 }

@@ -103,7 +103,7 @@ func moreSpecific(f1, f2 *govulncheck.Finding) int {
 		return -1
 	}
 	if fr1.Package == "" && fr2.Package != "" {
-		return -1
+		return 1
 	}
 	return 0 // findings always have module info
 }

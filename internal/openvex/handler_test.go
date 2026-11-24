@@ -158,6 +158,12 @@ func TestMoreSpecific(t *testing.T) {
 			[]*govulncheck.Frame{
 				frame("m1", "", "")},
 		},
+		{"mod-vs-pkg", 1,
+			[]*govulncheck.Frame{
+				frame("m1", "", "")},
+			[]*govulncheck.Frame{
+				frame("m1", "p1", "")},
+		},
 		{"mod-vs-sym", 1,
 			[]*govulncheck.Frame{
 				frame("m1", "", "")},
